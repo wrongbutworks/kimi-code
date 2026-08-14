@@ -8,15 +8,18 @@
  * `prompt` (attachment parts from the caller ride the same user message after
  * the rendered prompt), settles `{turn_id}` for the caller by awaiting the
  * launched turn (so activation failures — unknown skill, busy — surface
- * instead of vanishing), persists the derived title/lastPrompt through `sessionMetadata` for the main agent only
- * (publishing the live update through `event`), and reports `skill_invoked` /
- * `flow_invoked` through `telemetry`. `promptWithSkills` submits one prompt
- * preceded by one or more skill activations that share the prompt's
- * `submissionId`, so the group launches as a single turn and undoes as one
- * unit; every skill is validated before anything is recorded, so an invalid
- * name rejects the whole submission. `wire.replay` reapplies the fact as a
- * no-op, so neither the event nor telemetry fires on resume (matching the
- * former `restoring` guard). Bound at Agent scope.
+ * instead of vanishing), persists the derived title/lastPrompt through
+ * `sessionMetadata` for the main agent only (publishing the live update
+ * through `event`), and reports `skill_invoked` / `flow_invoked` through
+ * `telemetry`. `promptWithSkills` bundles one or more skill activations into
+ * the prompt's own user message: the rendered skill blocks precede the
+ * caller's parts in the content and each activation's metadata rides the
+ * prompt origin's `skillActivations`, so the bundle launches as a single
+ * turn and undoes as a single anchor. Every skill is validated before
+ * anything is recorded, so an invalid name or an empty skill list rejects
+ * the whole submission. The fact is transient (`persist: false`), so neither
+ * the event nor telemetry fires on resume — bundled activations are rebuilt
+ * from the prompt origin instead. Bound at Agent scope.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -25,7 +28,11 @@ import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 
 import type { ContentPart } from '#/kosong/contract/message';
 
-import type { ContextMessage, SkillActivationOrigin } from '#/agent/contextMemory/types';
+import type {
+  BundledSkillActivation,
+  ContextMessage,
+  SkillActivationOrigin,
+} from '#/agent/contextMemory/types';
 import { promptMetadataTextFromSkill, renderUserSlashSkillPrompt } from './prompt';
 import { promptMetadataTextFromContentParts } from '#/agent/prompt/promptMetadataText';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
@@ -51,6 +58,17 @@ import { applyPromptMetadataUpdate } from '#/session/sessionMetadata/promptMetad
 interface PreparedActivation {
   readonly origin: SkillActivationOrigin;
   readonly message: ContextMessage;
+}
+
+function bundledEntry(origin: SkillActivationOrigin): BundledSkillActivation {
+  return {
+    activationId: origin.activationId,
+    skillName: origin.skillName,
+    skillArgs: origin.skillArgs,
+    skillType: origin.skillType,
+    skillPath: origin.skillPath,
+    skillSource: origin.skillSource,
+  };
 }
 
 export class AgentSkillService extends Service implements IAgentSkillService {
@@ -97,8 +115,7 @@ export class AgentSkillService extends Service implements IAgentSkillService {
       );
     }
     await this.skillCatalog.ready;
-    const submissionId = input.submissionId ?? randomUUID();
-    const prepared = input.skills.map((skill) => this.prepare(skill, submissionId));
+    const prepared = input.skills.map((skill) => this.prepare(skill));
     if (this.scopeContext.agentId === MAIN_AGENT_ID) {
       await this.updatePromptMetadata(promptMetadataTextFromContentParts(input.input));
     }
@@ -108,11 +125,16 @@ export class AgentSkillService extends Service implements IAgentSkillService {
     const handle = await this.prompt.enqueue({
       message: {
         role: 'user',
-        content: [...input.input],
+        content: [
+          ...prepared.flatMap((activation) => activation.message.content),
+          ...input.input,
+        ],
         toolCalls: [],
-        origin: { kind: 'user', submissionId },
+        origin: {
+          kind: 'user',
+          skillActivations: prepared.map((activation) => bundledEntry(activation.origin)),
+        },
       },
-      messagesBefore: prepared.map((activation) => activation.message),
     });
     if (handle.state === 'pending') return undefined;
     const turn = await handle.launched;
@@ -123,7 +145,7 @@ export class AgentSkillService extends Service implements IAgentSkillService {
     this.recordActivation(origin);
   }
 
-  private prepare(input: SkillActivationInput, submissionId?: string): PreparedActivation {
+  private prepare(input: SkillActivationInput): PreparedActivation {
     const skill = this.skillCatalog.catalog.getSkill(input.name);
     if (skill === undefined) {
       throw new Error2(ErrorCodes.SKILL_NOT_FOUND, `Skill "${input.name}" was not found`);
@@ -160,7 +182,6 @@ export class AgentSkillService extends Service implements IAgentSkillService {
       skillPath: skill.path,
       skillSource: skill.source,
       skillArgs: input.args,
-      submissionId,
     };
     const message: ContextMessage = {
       role: 'user',
