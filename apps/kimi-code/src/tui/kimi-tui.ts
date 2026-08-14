@@ -134,6 +134,7 @@ import { createTUIState, type TUIState } from './tui-state';
 import {
   INITIAL_LIVE_PANE,
   type AppState,
+  type InlineSkillActivation,
   type KimiTUIOptions,
   type LivePaneState,
   type LoginProgressSpinnerHandle,
@@ -491,12 +492,14 @@ export class KimiTUI {
           : {}),
       };
     });
+    const skillCommandNames = new Set(this.skillCommandMap.keys());
     const provider = new FileMentionProvider(
       slashCommands,
       this.state.appState.workDir,
       this.fdPath,
       this.state.appState.additionalDirs,
       () => this.state.appState.inputMode,
+      skillCommandNames,
     );
     this.state.editor.setAutocompleteProvider(provider);
 
@@ -509,6 +512,7 @@ export class KimiTUI {
       }
     }
     this.state.editor.setArgumentHints(argumentHints);
+    this.state.editor.setSkillCommandNames(skillCommandNames);
   }
 
   refreshSlashCommandAutocomplete(): void {
@@ -1366,6 +1370,97 @@ export class KimiTUI {
     this.state.ui.requestRender();
   }
 
+  async sendInlineSkillUserInput(
+    text: string,
+    activations: readonly InlineSkillActivation[],
+    preExtracted?: ExtractionResult,
+  ): Promise<void> {
+    if (this.btwPanelController.sendUserInput(text, activations)) return;
+    if (this.state.appState.model.trim().length === 0) {
+      this.showError(LLM_NOT_SET_MESSAGE);
+      return;
+    }
+    let extraction: ReturnType<typeof extractMediaAttachments>;
+    try {
+      extraction = preExtracted ?? extractMediaAttachments(text, this.imageStore);
+    } catch (error) {
+      this.showError(`Failed to prepare media attachment: ${formatErrorMessage(error)}`);
+      return;
+    }
+    if (!this.validateMediaCapabilities(extraction)) return;
+    if (this.cacheHint.maybeInterceptOnSubmit(text, extraction, activations)) return;
+    let session = this.session;
+    if (session === undefined) {
+      // Dispatch only routes here on the v2 engine, so the session is created
+      // lazily on first use exactly like a normal prompt.
+      session = await this.ensureSession();
+      if (session === undefined) return;
+    }
+    if (
+      this.deferUserMessages ||
+      this.state.appState.goal?.status === 'active' ||
+      this.state.appState.streamingPhase !== 'idle' ||
+      this.state.appState.isCompacting
+    ) {
+      this.enqueueMessage(
+        text,
+        extraction.hasMedia
+          ? {
+              hasMedia: true,
+              parts: extraction.parts,
+              imageAttachmentIds: extraction.imageAttachmentIds,
+              inlineSkillActivations: activations,
+            }
+          : { inlineSkillActivations: activations },
+      );
+      this.updateQueueDisplay();
+      this.state.ui.requestRender();
+      return;
+    }
+    this.beginSessionRequest();
+    void this.runInlineSkillActivations(session, text, activations, extraction).catch(
+      (error: unknown) => {
+        this.failSessionRequest(`Skill activation failed: ${formatErrorMessage(error)}`);
+      },
+    );
+  }
+
+  private async runInlineSkillActivations(
+    session: Session,
+    text: string,
+    activations: readonly InlineSkillActivation[],
+    extraction: ReturnType<typeof extractMediaAttachments>,
+  ): Promise<void> {
+    const entries = this.state.transcriptEntries;
+    const entriesBefore = entries.length;
+    await session.promptWithSkills(
+      extraction.hasMedia ? extraction.parts : text,
+      activations.map((activation) => ({ name: activation.skillName, args: activation.args })),
+    );
+    // The engine bundles the activations into the prompt's own message, and
+    // the `skill.activated` events land synchronously during the call — so
+    // the cards just appended belong to this submission, and appending the
+    // user entry afterwards keeps the live transcript in the same order as a
+    // resumed replay (skill cards first, prompt last). Marking only happens
+    // once the submission was accepted: a rejected bundle leaves no cards and
+    // must not leave a local undo anchor the engine never recorded.
+    for (let i = entriesBefore; i < entries.length; i++) {
+      const entry = entries[i];
+      if (entry?.kind === 'skill_activation') {
+        entry.bundledWithPrompt = true;
+      }
+    }
+    this.appendTranscriptEntry({
+      id: nextTranscriptId(),
+      kind: 'user',
+      turnId: undefined,
+      renderMode: 'plain',
+      content: text,
+      imageAttachmentIds:
+        extraction.imageAttachmentIds.length > 0 ? extraction.imageAttachmentIds : undefined,
+    });
+  }
+
   validateMediaCapabilities(extraction: {
     hasMedia: boolean;
     imageAttachmentIds: readonly number[];
@@ -1436,7 +1531,9 @@ export class KimiTUI {
 
   private enqueueMessage(
     text: string,
-    options?: SendMessageOptions,
+    options?: SendMessageOptions & {
+      readonly inlineSkillActivations?: readonly InlineSkillActivation[];
+    },
     mode?: 'prompt' | 'bash',
   ): void {
     this.state.queuedMessages.push({
@@ -1448,6 +1545,7 @@ export class KimiTUI {
           ? options.imageAttachmentIds
           : undefined,
       mode,
+      inlineSkillActivations: options?.inlineSkillActivations,
     });
     this.track('input_queue');
   }
@@ -1479,6 +1577,25 @@ export class KimiTUI {
   sendQueuedMessage(session: Session, item: QueuedMessage): void {
     if (item.mode === 'bash') {
       void this.runShellCommandFromInput(item.text);
+      return;
+    }
+    if (item.inlineSkillActivations !== undefined && item.inlineSkillActivations.length > 0) {
+      // Media was extracted and validated at enqueue time; reuse the queued
+      // parts rather than re-extracting from a possibly-cleared image store.
+      this.beginSessionRequest();
+      void this.runInlineSkillActivations(
+        session,
+        item.text,
+        item.inlineSkillActivations,
+        {
+          parts: item.parts !== undefined ? [...item.parts] : [],
+          hasMedia: item.parts !== undefined && item.parts.length > 0,
+          imageAttachmentIds: item.imageAttachmentIds !== undefined ? [...item.imageAttachmentIds] : [],
+          videoAttachmentIds: [],
+        },
+      ).catch((error: unknown) => {
+        this.failSessionRequest(`Skill activation failed: ${formatErrorMessage(error)}`);
+      });
       return;
     }
     this.harness.withInteractiveAgent(item.agentId ?? MAIN_AGENT_ID, () => {
