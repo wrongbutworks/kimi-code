@@ -6,8 +6,9 @@
  * (a stateless, identity-apply Op), derives the `skill.activated` event
  * through the Op's `toEvent`, drives user-slash activations into a new turn via
  * `prompt` (attachment parts from the caller ride the same user message after
- * the rendered prompt), settles `{turn_id}` for the caller, persists the
- * derived title/lastPrompt through `sessionMetadata` for the main agent only
+ * the rendered prompt), settles `{turn_id}` for the caller by awaiting the
+ * launched turn (so activation failures — unknown skill, busy — surface
+ * instead of vanishing), persists the derived title/lastPrompt through `sessionMetadata` for the main agent only
  * (publishing the live update through `event`), and reports `skill_invoked` /
  * `flow_invoked` through `telemetry`. `promptWithSkills` submits one prompt
  * preceded by one or more skill activations that share the prompt's
@@ -79,8 +80,6 @@ export class AgentSkillService extends Service implements IAgentSkillService {
         'Cannot activate skill while another turn is active',
       );
     }
-    // Awaited (not fire-and-forget): the caller gets the launched turn id and
-    // activation failures (unknown skill, busy) surface instead of vanishing.
     if (this.scopeContext.agentId === MAIN_AGENT_ID) {
       await this.updatePromptMetadata(promptMetadataTextFromSkill(input));
     }
@@ -90,6 +89,12 @@ export class AgentSkillService extends Service implements IAgentSkillService {
   async promptWithSkills(input: PromptWithSkillsInput): Promise<PromptLaunchResult | undefined> {
     if (input.input.length === 0) {
       throw new Error2(ErrorCodes.REQUEST_INVALID, 'promptWithSkills requires a non-empty prompt');
+    }
+    if (input.skills.length === 0) {
+      throw new Error2(
+        ErrorCodes.REQUEST_INVALID,
+        'promptWithSkills requires at least one skill',
+      );
     }
     await this.skillCatalog.ready;
     const submissionId = input.submissionId ?? randomUUID();
