@@ -1,5 +1,13 @@
 # @moonshot-ai/kimi-code
 
+## 0.36.2
+
+### Patch Changes
+
+- [#2940](https://github.com/MoonshotAI/kimi-code/pull/2940) [`6b72345`](https://github.com/MoonshotAI/kimi-code/commit/6b72345f8bb03487e3bcc05b541e65484818428c) Thanks [@bj456736](https://github.com/bj456736)! - Print the full `kimi --resume` command after `/fork` and copy it to the clipboard, so the fork can be entered directly from a new CLI process.
+
+- [#2928](https://github.com/MoonshotAI/kimi-code/pull/2928) [`d96cd03`](https://github.com/MoonshotAI/kimi-code/commit/d96cd037702637305422222e985139e51ff83c8c) Thanks [@chengluyu](https://github.com/chengluyu)! - Warn in the footer while a typed `/goal` objective exceeds the 4000-character limit, and restore the input instead of losing it when an over-limit objective is rejected. The error message now suggests putting long content in a file and referencing the file path.
+
 ## 0.36.1
 
 ### Patch Changes
